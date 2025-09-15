@@ -1,159 +1,164 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-
 #include <openssl/evp.h>
 
-static unsigned char hexchar2byte(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-    return 0;
+void pad_key(const char *word, unsigned char *key) {
+    int len = strlen(word);
+    memset(key, '#', 16);
+    if (len > 16) len = 16;
+    memcpy(key, word, len);
 }
 
-static unsigned char *hex_to_bytes(const char *hex, size_t *out_len) {
-    size_t len = strlen(hex);
-    if (len % 2 != 0) return NULL;
-    *out_len = len / 2;
-    unsigned char *buf = malloc(*out_len);
-    for (size_t i = 0; i < *out_len; ++i) {
-        buf[i] = (hexchar2byte(hex[2*i]) << 4) | hexchar2byte(hex[2*i + 1]);
+int try_decrypt_with_flag(unsigned char *ciphertext, int ciphertext_len,
+                unsigned char *iv, unsigned char *key, unsigned char *plaintext, int disable_padding) {
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int len = 0, plaintext_len = 0;
+
+    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv)) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
     }
+
+    if (disable_padding) {
+        EVP_CIPHER_CTX_set_padding(ctx, 0);
+    }
+
+    if (1 != EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len)) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    plaintext_len = len;
+
+    if (1 != EVP_DecryptFinal_ex(ctx, plaintext + len, &len)) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1; // decryption failed
+    }
+    plaintext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+    plaintext[plaintext_len] = '\0';
+    return plaintext_len;
+}
+
+unsigned char *read_file(const char *path, long *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    rewind(f);
+    unsigned char *buf = malloc(len > 0 ? len : 1);
+    if (len > 0) fread(buf, 1, len, f);
+    fclose(f);
+    *out_len = len;
     return buf;
 }
 
-int encrypt_aes_128_cbc(const unsigned char *plaintext, int plaintext_len,
-                        const unsigned char *key, const unsigned char *iv,
-                        unsigned char **ciphertext, int *cipher_len) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return 0;
-    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv)) {
-        EVP_CIPHER_CTX_free(ctx);
-        return 0;
+void print_hexdump_sample(unsigned char *buf, int len) {
+    int n = len < 64 ? len : 64;
+    for (int i = 0; i < n; ++i) {
+        unsigned char c = buf[i];
+        if (c >= 32 && c <= 126) putchar(c); else putchar('.');
     }
-
-    int len;
-    int ciphertext_len_alloc = plaintext_len + EVP_CIPHER_block_size(EVP_aes_128_cbc());
-    unsigned char *out = malloc(ciphertext_len_alloc);
-    if (!out) {
-        EVP_CIPHER_CTX_free(ctx);
-        return 0;
-    }
-
-    if (1 != EVP_EncryptUpdate(ctx, out, &len, plaintext, plaintext_len)) {
-        free(out);
-        EVP_CIPHER_CTX_free(ctx);
-        return 0;
-    }
-    int total_len = len;
-
-    if (1 != EVP_EncryptFinal_ex(ctx, out + len, &len)) {
-        free(out);
-        EVP_CIPHER_CTX_free(ctx);
-        return 0;
-    }
-    total_len += len;
-
-    *ciphertext = out;
-    *cipher_len = total_len;
-
-    EVP_CIPHER_CTX_free(ctx);
-    return 1;
+    putchar('\n');
 }
 
-static void trim_newline(char *s) {
-    size_t n = strlen(s);
-    while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r')) {
-        s[n-1] = '\0';
-        --n;
-    }
-}
-
-int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s wordlist.txt plaintext_file target_cipher_hex\n", argv[0]);
+int main(int argc, char *argv[]) {
+    if (!(argc == 4 || argc == 5)) {
+        printf("Usage:\n  %s <wordlist.txt> <cipher_with_prepended_iv.bin> <plaintext_ref.txt>\n", argv[0]);
+        printf("or\n  %s <wordlist.txt> <cipher.bin> <iv.bin> <plaintext_ref.txt>\n", argv[0]);
         return 1;
     }
 
     const char *wordlist_path = argv[1];
-    const char *plaintext_path = argv[2];
-    const char *target_hex = argv[3];
+    const char *cipher_path = argv[2];
+    const char *iv_path = NULL;
+    const char *plain_ref_path = NULL;
+    int iv_prepended = 0;
 
-    // read plaintext bytes exactly (do not append newline)
-    FILE *pf = fopen(plaintext_path, "rb");
-    if (!pf) { perror("opening plaintext file"); return 1; }
-    fseek(pf, 0, SEEK_END);
-    long plaintext_len = ftell(pf);
-    fseek(pf, 0, SEEK_SET);
-    if (plaintext_len < 0) { perror("ftell"); fclose(pf); return 1; }
-    unsigned char *plaintext = malloc(plaintext_len);
-    if (!plaintext) { fclose(pf); return 1; }
-    if (fread(plaintext, 1, plaintext_len, pf) != (size_t)plaintext_len) {
-        perror("reading plaintext");
-        free(plaintext);
-        fclose(pf);
-        return 1;
+    if (argc == 4) {
+        plain_ref_path = argv[3];
+        iv_prepended = 1;
+    } else {
+        iv_path = argv[3];
+        plain_ref_path = argv[4];
+        iv_prepended = 0;
     }
-    fclose(pf);
 
-    // parse target cipher hex
-    size_t target_len;
-    unsigned char *target = hex_to_bytes(target_hex, &target_len);
-    if (!target) { fprintf(stderr, "Invalid target hex\n"); free(plaintext); return 1; }
+    FILE *words = fopen(wordlist_path, "r");
+    if (!words) { perror("wordlist"); return 1; }
 
-    // fixed IV given in the problem
-    const char *iv_hex = "aabbccddeeff00998877665544332211";
-    size_t iv_len;
-    unsigned char *iv = hex_to_bytes(iv_hex, &iv_len);
-    if (!iv || iv_len != 16) { fprintf(stderr, "Invalid IV\n"); free(plaintext); free(target); return 1; }
+    long cipher_len = 0;
+    unsigned char *cipher_buf = read_file(cipher_path, &cipher_len);
+    if (!cipher_buf) { perror("cipherfile"); fclose(words); return 1; }
 
-    FILE *wf = fopen(wordlist_path, "r");
-    if (!wf) { perror("opening wordlist"); free(plaintext); free(target); free(iv); return 1; }
+    unsigned char iv[16];
+    unsigned char *ciphertext = NULL;
+    long ciphertext_len = 0;
 
-    char line[256];
+    if (iv_prepended) {
+        if (cipher_len < 16) { fprintf(stderr, "cipher file too small to contain IV\n"); free(cipher_buf); fclose(words); return 1; }
+        memcpy(iv, cipher_buf, 16);
+        ciphertext = cipher_buf + 16;
+        ciphertext_len = cipher_len - 16;
+    } else {
+        long iv_len = 0;
+        unsigned char *iv_buf = read_file(iv_path, &iv_len);
+        if (!iv_buf) { perror("ivfile"); free(cipher_buf); fclose(words); return 1; }
+        if (iv_len < 16) { fprintf(stderr, "iv file must be at least 16 bytes\n"); free(iv_buf); free(cipher_buf); fclose(words); return 1; }
+        memcpy(iv, iv_buf, 16);
+        free(iv_buf);
+        ciphertext = cipher_buf;
+        ciphertext_len = cipher_len;
+    }
+
+    long ref_len = 0;
+    unsigned char *ref_plain = read_file(plain_ref_path, &ref_len);
+    if (!ref_plain) { perror("plaintext_ref"); free(cipher_buf); fclose(words); return 1; }
+    unsigned char *ref_null = malloc(ref_len + 1);
+    memcpy(ref_null, ref_plain, ref_len);
+    ref_null[ref_len] = '\0';
+    free(ref_plain);
+
+    unsigned char key[16];
+    unsigned char plaintext[8192];
+    char word[256];
     int found = 0;
-    while (fgets(line, sizeof(line), wf)) {
-        trim_newline(line);
-        // skip empty lines
-        if (line[0] == '\0') continue;
-        size_t wlen = strlen(line);
-        if (wlen > 16) continue; // word longer than 16 chars - skip
 
-        // prepare key: copy word and pad with '#'
-        unsigned char key[16];
-        memset(key, '#', 16);
-        memcpy(key, (unsigned char*)line, wlen);
+    while (fgets(word, sizeof(word), words)) {
+        word[strcspn(word, "\r\n")] = 0;
+        pad_key(word, key);
 
-        // encrypt
-        unsigned char *ciphertext = NULL;
-        int cipher_len = 0;
-        if (!encrypt_aes_128_cbc(plaintext, (int)plaintext_len, key, iv, &ciphertext, &cipher_len)) {
-            fprintf(stderr, "Encryption error for word '%s'\n", line);
-            continue;
+        int pt_len = try_decrypt_with_flag(ciphertext, (int)ciphertext_len, iv, key, plaintext, 0);
+        if (pt_len > 0) {
+            if (strncmp((char *)plaintext, (char *)ref_null, ref_len) == 0) {
+                printf("[+] Found key (PKCS7): \"%s\"\n", word);
+                found = 1; break;
+            } else {
+                printf("[?] Candidate key (PKCS7) : \"%s\" — decrypted (first 64 chars):\n", word);
+                print_hexdump_sample(plaintext, pt_len);
+                // continue searching
+            }
         }
 
-        // compare lengths first
-        if ((size_t)cipher_len == target_len && memcmp(ciphertext, target, target_len) == 0) {
-            printf("FOUND key word: '%s'\n", line);
-            printf("Full 16-byte key (hex): ");
-            for (int i = 0; i < 16; ++i) printf("%02x", key[i]);
-            printf("\n");
-            found = 1;
-            free(ciphertext);
-            break;
+        pt_len = try_decrypt_with_flag(ciphertext, (int)ciphertext_len, iv, key, plaintext, 1);
+        if (pt_len > 0) {
+            if (strncmp((char *)plaintext, (char *)ref_null, ref_len) == 0) {
+                printf("[+] Found key (NoPad): \"%s\"\n", word);
+                found = 1; break;
+            } else {
+                printf("[?] Candidate key (NoPad) : \"%s\" — decrypted (first 64 chars):\n", word);
+                print_hexdump_sample(plaintext, pt_len);
+            }
         }
-
-        free(ciphertext);
     }
 
-    if (!found) {
-        printf("No matching key found in wordlist.\n");
-    }
+    if (!found) printf("[-] Key not found.\n");
 
-    free(plaintext);
-    free(target);
-    free(iv);
-    fclose(wf);
+    free(ref_null);
+    free(cipher_buf);
+    fclose(words);
     return 0;
 }
